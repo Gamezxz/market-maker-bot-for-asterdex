@@ -18,6 +18,34 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 
 import requests
+from pathlib import Path
+
+
+def _load_env_file() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        content = env_path.read_text(encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Unable to read .env file: %s", exc)
+        return
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env_file()
 
 # ---------------------------------------------------------------------------
 # Configuration (all adjustable values are here)
@@ -25,15 +53,21 @@ import requests
 API_KEY = os.getenv("ASTERDEX_API_KEY", "")
 API_SECRET = os.getenv("ASTERDEX_API_SECRET", "")
 SYMBOL = "ASTERUSDT"
-SPREAD_USD = Decimal("0.002")  # Distance between sell and buy quotes in USDT
-ORDER_SIZE_USD = Decimal("30")  # Target quote size per order
+ACCOUNT_CAPITAL_USD = Decimal("10000")  # Total trading capital allocated to the bot
+RISK_PER_ORDER = Decimal("0.02")  # 2% of capital posted on each side per cycle
+MAX_INVENTORY_FRACTION = Decimal("0.08")  # Allow up to 8% capital exposure before managing inventory
+PROFIT_TARGET_FRACTION = Decimal("0.005")  # Accept 0.5% profit on inventory before flattening
+SPREAD_USD = Decimal("0.004")  # Distance between sell and buy quotes in USDT
+ORDER_SIZE_USD = (ACCOUNT_CAPITAL_USD * RISK_PER_ORDER).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+MIN_ORDER_SIZE_FRACTION = Decimal("0.25")  # Do not reduce size below 25% of base order
+INVENTORY_DECAY_STRENGTH = Decimal("1.0")  # Higher values shrink orders faster as inventory grows
 ORDER_TIMEOUT_SECONDS = 60  # Cancel & refresh quotes if untouched for this long
 COUNTER_FILL_WAIT_SECONDS = 30  # Wait for the opposite side after one fill
 SLEEP_SECONDS = 1.0  # Main loop sleep between iterations
 POSITION_CHECK_INTERVAL = 5.0  # Seconds between position refreshes
-INVENTORY_THRESHOLD_USD = Decimal("30")  # Notional (USDT) threshold that triggers monitoring
-MIN_PROFIT_TO_CLOSE = Decimal("10")  # Unrealized PnL threshold in USDT required before closing
-PNL_HOLD_SECONDS = 300  # Hold profit for 5 minutes before flattening
+INVENTORY_THRESHOLD_USD = (ACCOUNT_CAPITAL_USD * MAX_INVENTORY_FRACTION).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+MIN_PROFIT_TO_CLOSE = (ACCOUNT_CAPITAL_USD * PROFIT_TARGET_FRACTION).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+PNL_HOLD_SECONDS = 60  # Hold profit for 1 minutes before flattening
 USE_TESTNET = False  # Flip to True if you have testnet credentials
 
 # ---------------------------------------------------------------------------
@@ -74,6 +108,7 @@ class AsterMarketMaker:
 
         self._logger = logging.getLogger(self.__class__.__name__)
         self._logger.info("Starting market maker | symbol=%s", SYMBOL)
+        self._log_configuration()
 
         self._symbol_info = self._fetch_symbol_info()
         (
@@ -90,6 +125,16 @@ class AsterMarketMaker:
         self.first_fill_time: Optional[float] = None
         self._last_position_check = 0.0
         self._profit_timer_started: Optional[float] = None
+        self._last_position_qty = Decimal("0")
+        self._last_position_notional = Decimal("0")
+
+    def _log_configuration(self) -> None:
+        self._logger.info(
+            "Config | order_size_usd=%s | inventory_threshold_usd=%s | min_profit_to_close=%s",
+            self._decimal_to_str(ORDER_SIZE_USD),
+            self._decimal_to_str(INVENTORY_THRESHOLD_USD),
+            self._decimal_to_str(MIN_PROFIT_TO_CLOSE),
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -143,28 +188,19 @@ class AsterMarketMaker:
         if sell_price <= buy_price:
             sell_price = self._round_price(buy_price + self.price_tick)
 
-        target_qty = self._floor_to_step(ORDER_SIZE_USD / mid_price, self.qty_step)
-        if target_qty < self.min_qty:
-            raise RuntimeError(
-                "Configured order size results in quantity below minimum lot size: "
-                f"qty={target_qty}, min={self.min_qty}"
-            )
+        base_qty = ORDER_SIZE_USD / mid_price
 
-        notional = target_qty * mid_price
-        if notional < self.min_notional:
-            raise RuntimeError(
-                "Configured order size below exchange minimum notional: "
-                f"notional={notional}, min={self.min_notional}"
-            )
+        buy_qty, buy_scale = self._target_quantity_for_side(base_qty, mid_price, "BUY")
+        sell_qty, sell_scale = self._target_quantity_for_side(base_qty, mid_price, "SELL")
 
-        buy_response = self._place_limit_order("BUY", buy_price, target_qty)
-        sell_response = self._place_limit_order("SELL", sell_price, target_qty)
+        buy_response = self._place_limit_order("BUY", buy_price, buy_qty)
+        sell_response = self._place_limit_order("SELL", sell_price, sell_qty)
 
         self.buy_order = OrderState(
             order_id=int(buy_response["orderId"]),
             side="BUY",
             price=buy_price,
-            quantity=target_qty,
+            quantity=buy_qty,
             created_at=time.time(),
             status=buy_response.get("status", "NEW"),
             executed_qty=Decimal(buy_response.get("executedQty", "0")),
@@ -173,7 +209,7 @@ class AsterMarketMaker:
             order_id=int(sell_response["orderId"]),
             side="SELL",
             price=sell_price,
-            quantity=target_qty,
+            quantity=sell_qty,
             created_at=time.time(),
             status=sell_response.get("status", "NEW"),
             executed_qty=Decimal(sell_response.get("executedQty", "0")),
@@ -182,12 +218,39 @@ class AsterMarketMaker:
         self.first_fill_side = None
         self.first_fill_time = None
         self._logger.info(
-            "Placed quotes | buy=%s @ %s | sell=%s @ %s",
+            "Placed quotes | buy=%s @ %s | sell=%s @ %s | scales=(buy:%s, sell:%s)",
             self._decimal_to_str(self.buy_order.quantity),
             self._decimal_to_str(self.buy_order.price),
             self._decimal_to_str(self.sell_order.quantity),
             self._decimal_to_str(self.sell_order.price),
+            self._decimal_to_str(buy_scale),
+            self._decimal_to_str(sell_scale),
         )
+
+    def _target_quantity_for_side(
+        self,
+        base_qty: Decimal,
+        mid_price: Decimal,
+        side: str,
+    ) -> tuple[Decimal, Decimal]:
+        scale = self._order_size_scale(side)
+        adjusted_qty = base_qty * scale
+        target_qty = self._floor_to_step(adjusted_qty, self.qty_step)
+        if target_qty < self.min_qty:
+            target_qty = self.min_qty
+
+        effective_scale = scale
+        if base_qty > 0:
+            effective_scale = (target_qty / base_qty).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+
+        notional = target_qty * mid_price
+        if self.min_notional > 0 and notional < self.min_notional:
+            raise RuntimeError(
+                "Configured order size below exchange minimum notional: "
+                f"side={side}, notional={notional}, min={self.min_notional}"
+            )
+
+        return target_qty, effective_scale
 
     def _evaluate_cycle_timers(self, now: float) -> None:
         if not self.buy_order or not self.sell_order:
@@ -292,6 +355,8 @@ class AsterMarketMaker:
             if self._profit_timer_started:
                 self._logger.debug("Flat position; clearing profit timer")
             self._profit_timer_started = None
+            self._last_position_qty = Decimal("0")
+            self._last_position_notional = Decimal("0")
             return
 
         abs_position = abs(position_amt)
@@ -311,6 +376,9 @@ class AsterMarketMaker:
             self._decimal_to_str(position_notional),
             self._decimal_to_str(unrealized_profit),
         )
+
+        self._last_position_qty = position_amt
+        self._last_position_notional = position_notional
 
         if position_notional >= INVENTORY_THRESHOLD_USD and unrealized_profit >= MIN_PROFIT_TO_CLOSE:
             if not self._profit_timer_started:
@@ -536,6 +604,28 @@ class AsterMarketMaker:
         quantized = (scaled * self.price_tick).quantize(self.price_tick, rounding=ROUND_HALF_UP)
         return quantized
 
+    def _order_size_scale(self, side: str) -> Decimal:
+        notional = abs(self._last_position_notional)
+        if notional <= 0 or INVENTORY_THRESHOLD_USD <= 0:
+            return Decimal("1")
+
+        position_side: Optional[str]
+        if self._last_position_qty > 0:
+            position_side = "BUY"
+        elif self._last_position_qty < 0:
+            position_side = "SELL"
+        else:
+            position_side = None
+
+        if position_side and position_side == side.upper():
+            return Decimal("1")
+
+        ratio = notional / INVENTORY_THRESHOLD_USD
+        decay = Decimal("1") / (Decimal("1") + (ratio * INVENTORY_DECAY_STRENGTH))
+        if decay > Decimal("1"):
+            decay = Decimal("1")
+        return max(decay, MIN_ORDER_SIZE_FRACTION)
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
@@ -543,10 +633,32 @@ class AsterMarketMaker:
 def configure_logging() -> None:
     level_name = os.getenv("MM_LOG_LEVEL", "INFO")
     level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    class _ColorFormatter(logging.Formatter):
+        COLOR_MAP = {
+            logging.DEBUG: "\033[36m",  # Cyan
+            logging.INFO: "\033[32m",  # Green
+            logging.WARNING: "\033[33m",  # Yellow
+            logging.ERROR: "\033[31m",  # Red
+            logging.CRITICAL: "\033[35m",  # Magenta
+        }
+        RESET = "\033[0m"
+
+        def format(self, record: logging.LogRecord) -> str:
+            message = super().format(record)
+            color = self.COLOR_MAP.get(record.levelno)
+            if not color:
+                return message
+            return f"{color}{message}{self.RESET}"
+
+    formatter = _ColorFormatter("%(levelname)s | %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    for existing in list(root_logger.handlers):
+        root_logger.removeHandler(existing)
+    root_logger.addHandler(handler)
+    root_logger.setLevel(level)
 
 
 def main() -> None:
