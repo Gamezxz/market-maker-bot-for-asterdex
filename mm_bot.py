@@ -422,7 +422,33 @@ class AsterMarketMaker:
     # ------------------------------------------------------------------
     # REST helpers
     # ------------------------------------------------------------------
+    def _fetch_last_price(self) -> Optional[Decimal]:
+        try:
+            ticker = self._request(
+                self.futures_base_url,
+                "/fapi/v1/ticker/price",
+                params={"symbol": SYMBOL},
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Failed to fetch last price: %s", exc)
+            return None
+
+        price_str = ticker.get("price") if isinstance(ticker, dict) else None
+        if not price_str:
+            self._logger.warning("Ticker price response missing price field: %s", ticker)
+            return None
+
+        try:
+            return Decimal(price_str)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.warning("Invalid last price payload %s: %s", price_str, exc)
+            return None
+
     def _fetch_mid_price(self) -> Optional[tuple[Decimal, Decimal]]:
+        last_price = self._fetch_last_price()
+        if last_price is not None and last_price > 0:
+            return last_price, last_price
+
         try:
             depth = self._request(
                 self.futures_base_url,
